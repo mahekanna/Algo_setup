@@ -1,0 +1,643 @@
+#########################################################################################################################################################
+# Script Name : Generic Options Backtest Tool.
+# Author      : www.ezeetrading.in
+# Objective   : Generic Backtest tool to be able to test 
+#              - multiple options buying strategy, 
+#              - that has entry condition based on buy_above, SL and Target.
+#              - Save the Trade log and startagey performance stats in the respective folder of the Strategy.
+#              - Visualise all the indicators, entry, SL, Target and exit points on options chart similar to as displayed on Trading View.
+#              - Easy addition of stratgies by adding code in respective STRATEGY_NUMBER section, without impacting the other strategy codes.
+#              - Generate log of candle time, indicator values, entry, exit, pnl, etc for trouble shooting later if needed.
+# Versions:
+#              1.4 : Initial Version.
+#              1.4.1 : os independent file path handling. (using os.path.join)
+#########################################################################################################################################################
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import FancyArrowPatch
+import os
+import pandas
+import pickle
+import pandas_ta as ta
+import datetime
+import math
+import logging
+###########################################################################
+#      Step 0 : Configs
+###########################################################################
+
+STRATEGY_NUMBER = 1 # 1- Gann, 2 - WAT , 3- FLD
+if STRATEGY_NUMBER == 1:
+    STRATEGY_NAME = "GANN"
+elif STRATEGY_NUMBER == 2:
+    STRATEGY_NAME = "WAT"
+elif STRATEGY_NUMBER == 3:
+    STRATEGY_NAME = "FLD"
+
+#DATA_LOCATION = "D:\\Dropbox\\Office\\"
+DATA_LOCATION = os.path.join("D:\\", "Dropbox", "Office")
+#BT_LOCATION = "D:\\Backtest\\"+str(STRATEGY_NAME)+"\\"
+BT_LOCATION = os.path.join("D:\\", "Backtest", str(STRATEGY_NAME))
+#BT_LOCATION+"plots\\"
+PLOTS_LOCATION = os.path.join(BT_LOCATION, "plots")
+
+
+
+
+UNDERLYING = "BANKNIFTY"
+STRIKE_DIFF = 100
+BACKTEST_TIMEFRAME = 'minute'
+candle_timeframe_in_minutes = 15
+candle_timeframe = str(candle_timeframe_in_minutes)+'T'
+start_time = datetime.time(9, 30)
+exit_time = datetime.time(15, 10)
+atr_period = 14  # ATR period
+multiplier = 1.5  # Gann multiplier
+maLength = 50
+risk_reward = 2
+SAVE_LOGS = True
+
+# Define start and end times of the data used Market_time.
+Market_start_time = "09:15:00"
+Market_end_time = "15:30:00"
+
+
+
+#SPOT_DATA_LOCATION = DATA_LOCATION+"data raw\\13Y\\NSE_INDEX\\minute\\"
+SPOT_DATA_LOCATION = os.path.join(DATA_LOCATION, "data raw", "13Y", "NSE_INDEX", "minute")
+#OPTIONS_DATA_LOCATION = DATA_LOCATION+"data raw\\13Y\\NFO\\OPTIDX\\minute\\"
+OPTIONS_DATA_LOCATION = os.path.join(DATA_LOCATION, "data raw", "13Y", "NFO", "OPTIDX", "minute")
+#expiry_day_mapper_file = DATA_LOCATION+"data processed\\13Y\\NSE_INDEX\\minute\\"+"expiry_day_mapper_"+UNDERLYING+".pickle"
+expiry_day_mapper_file = os.path.join(DATA_LOCATION, "data processed", "13Y", "NSE_INDEX", "minute", f"expiry_day_mapper_{UNDERLYING}.pickle")
+with open(expiry_day_mapper_file, 'rb') as f:
+    expiry_day_mapper = pickle.load(f)
+
+
+RUN_FOR_SELECTED_YEARS=True
+SELECTED_YEARS = [2019,2020,2021,2022,2023,2024]
+#SELECTED_YEARS = [2024]
+
+
+if not os.path.exists(BT_LOCATION):
+    os.makedirs(BT_LOCATION)
+
+#if not os.path.exists(BT_LOCATION+"plots\\"):
+#    os.makedirs(BT_LOCATION+"plots\\")
+
+# Check if plots directory exists, if not, create it
+if not os.path.exists(PLOTS_LOCATION):
+    os.makedirs(PLOTS_LOCATION)
+
+#logging.basicConfig(filename=BT_LOCATION+str("log")+"_"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")+'.log', level=logging.WARNING, format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s')
+log_file = os.path.join(BT_LOCATION, f"log_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.log")
+logging.basicConfig(filename=log_file, level=logging.WARNING, format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s')
+
+def log_and_display(*args,**kwargs):
+    if SAVE_LOGS:
+        try:
+            line_to_print=""
+            for line in args:
+                line_to_print +=str(line)+" "
+            logging.warning(line_to_print)
+            print(line_to_print)
+        except:
+            pass
+    
+###########################################################################
+#      Step 1 : Get the spot price at 9:15 daily.
+###########################################################################
+
+#data = pandas.read_parquet(SPOT_DATA_LOCATION+UNDERLYING+".parquet")
+data = pandas.read_parquet(os.path.join(SPOT_DATA_LOCATION, f"{UNDERLYING}.parquet"))
+
+data.drop_duplicates(inplace=True)
+data['datetime'] = pd.to_datetime(data['datetime'])
+
+if RUN_FOR_SELECTED_YEARS:
+    data = data[data['datetime'].dt.year.isin(SELECTED_YEARS)]
+data = data.sort_values("datetime")
+
+
+# Filter the dataframe for times >= 9:15 AM
+filtered_data = data[data['datetime'].dt.time >= pd.Timestamp('09:15').time()]
+
+# Extract the date part from the 'datetime' column
+filtered_data['date'] = filtered_data['datetime'].dt.date
+
+# Group by date and get the first close price for each group
+spot_at_915_df = filtered_data.groupby('date').first().reset_index()
+
+# Keep only the necessary columns
+spot_at_915_df = spot_at_915_df[['date', 'close']].set_index('date')
+
+
+
+########################################################################################################
+#      Some function definations
+########################################################################################################
+
+
+# Gann calculation function(change if needed - can be simplified)
+def Gann_get_buy_sell_entry_sl_target_levels(price, atrVal, mult):
+    # Calculate square root of the given price
+    root = math.sqrt(price)
+    minus_two = root - 2
+    rounded = math.ceil(minus_two)
+    
+    # Initialize empty lists to hold intermediate and final values
+    x = []
+    sqr_x = []
+    sqr_x_rounded = []
+    
+    # Create Gann sequence
+    for i in range(24):
+        val = rounded + 0.125 * (i + 1)
+        x.append(val)
+        squared_val = val ** 2
+        sqr_x.append(squared_val)
+        sqr_x_rounded.append(round(squared_val, 2))
+    
+    # Find the minimum positive index where the value is >= price
+    min_positive_index = -1
+    for i in range(len(sqr_x_rounded)):
+        if sqr_x_rounded[i] >= price:
+            min_positive_index = i
+            break
+
+    # Initialize arrays for support, resistance, buy and sell targets
+    support = []
+    resistance = []
+    buy_target = []
+    sell_target = []
+    buy_sl = []
+    sell_sl =[]
+    # Initialize buy_above and sell_below as None
+    buy_above = None
+    sell_below = None
+    
+    # Calculate support, resistance, buy and sell targets if valid min_positive_index is found
+    if min_positive_index >= 0:
+        buy_above = sqr_x_rounded[min_positive_index]
+        sell_below = sqr_x_rounded[min_positive_index - 1] if min_positive_index > 0 else None
+        
+        for i in range(5):
+            if min_positive_index - 2 - i >= 0:
+                support.append(sqr_x_rounded[min_positive_index - 2 - i])
+            if min_positive_index + 1 + i < len(sqr_x_rounded):
+                resistance.append(sqr_x_rounded[min_positive_index + 1 + i])
+            
+            # Calculate the adjusted targets using ATR and multiplier
+            buy_target.append(price + atrVal * mult * risk_reward)
+            sell_target.append(price - atrVal * mult * risk_reward)
+            buy_sl.append(price - atrVal * mult)
+            sell_sl.append(price + atrVal * mult)
+    
+    return buy_above, sell_below, buy_target[0], sell_target[0], buy_sl[0], sell_sl[0]
+
+
+
+
+###########################################################################################
+# Calculate performance metrics
+###########################################################################################
+def calculate_metrics_old(ALL_TRADES_DF):
+
+    # Calculate total profit, total loss, and profit percentage
+    end_pnl = ALL_TRADES_DF['PnL'].sum()
+    total_profit = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] > 0]['PnL'].sum()
+    total_loss = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] < 0]['PnL'].sum()
+    #profit_percentage = ((total_profit + total_loss) / initial_balance) * 100
+
+    # Calculate Sharpe ratio
+    mean_return = ALL_TRADES_DF['PnL'].mean()
+    std_return = ALL_TRADES_DF['PnL'].std()
+    sharpe_ratio = mean_return / std_return if std_return != 0 else 0
+
+    # Count winning and losing trades
+    winning_trades = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] > 0].shape[0]
+    losing_trades = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] < 0].shape[0]
+    stats = {
+            'end_pnl':end_pnl,
+            'total_profit':total_profit,
+            'total_loss':total_loss,
+            #'profit_percentage':profit_percentage,
+            'sharpe_ratio':sharpe_ratio,
+            'winning_trades':winning_trades,
+            'losing_trades':losing_trades
+            }
+
+    return stats
+
+
+def calculate_metrics(ALL_TRADES_DF, initial_balance, trading_days_per_year=252):
+    
+    # Sort the DataFrame by 'Entry Time'
+    ALL_TRADES_DF = ALL_TRADES_DF.sort_values("Entry Time")
+    
+    # Calculate total profit, total loss, and profit percentage
+    end_pnl = ALL_TRADES_DF['PnL'].sum()
+    total_profit = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] > 0]['PnL'].sum()
+    total_loss = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] < 0]['PnL'].sum()
+
+    # Calculate Sharpe ratio
+    mean_return = ALL_TRADES_DF['PnL'].mean()
+    std_return = ALL_TRADES_DF['PnL'].std()
+    sharpe_ratio = mean_return / std_return if std_return != 0 else 0
+
+    # Count winning and losing trades
+    winning_trades = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] > 0].shape[0]
+    losing_trades = ALL_TRADES_DF[ALL_TRADES_DF['PnL'] < 0].shape[0]
+
+    # Calculate drawdown
+    cum_returns = (ALL_TRADES_DF['PnL'].cumsum() + initial_balance)
+    running_max = cum_returns.cummax()
+    drawdown = (running_max - cum_returns) / running_max * 100
+    max_drawdown = drawdown.max()
+
+    # Calculate num_years from the DataFrame
+    start_date = ALL_TRADES_DF["Entry Time"].min()
+    end_date = ALL_TRADES_DF["Entry Time"].max()
+    num_years = (end_date - start_date).days / 365.25  # Adjust for leap years
+    
+    # Calculate CAGR
+    #num_years = len(ALL_TRADES_DF) / trading_days_per_year
+    end_balance = initial_balance + end_pnl
+    cagr = (end_balance / initial_balance) ** (1 / num_years) - 1 if num_years > 0 else 0
+
+    # Calculate CAGR/Max Drawdown ratio
+    cagr_dd_ratio = cagr / (max_drawdown /100) if max_drawdown != 0 else float('inf')
+
+    stats = {
+        'end_pnl': end_pnl,
+        'total_profit': total_profit,
+        'total_loss': total_loss,
+        'sharpe_ratio': sharpe_ratio,
+        'winning_trades': winning_trades,
+        'losing_trades': losing_trades,
+        'max_drawdown': max_drawdown,
+        'cagr': cagr,
+        'cagr_dd_ratio': cagr_dd_ratio,
+        'num_years': num_years        
+    }
+
+    return stats
+
+
+########################################################################################################
+#      Step 2 : Now iterate over spot_at_915_df and generate backtest tradelog and plots.
+########################################################################################################
+
+ALL_TRADES = []
+for DATE , underlying_price_at_915 in spot_at_915_df.iterrows():
+    try:
+        EXPIRY_DATE = expiry_day_mapper[DATE]
+        
+        EXPIRY_DATE_STRING = EXPIRY_DATE.strftime('%Y_%m_%d')
+        DATE_STRING = DATE.strftime('%Y_%m_%d')
+        
+        ATM_strike = int(round(underlying_price_at_915.iloc[0] / STRIKE_DIFF) * STRIKE_DIFF)
+        CE_ATM = ATM_strike
+        CE_ITM = ATM_strike-STRIKE_DIFF
+        CE_OTM = ATM_strike+STRIKE_DIFF
+        PE_ATM = ATM_strike
+        PE_ITM = ATM_strike+STRIKE_DIFF
+        PE_OTM = ATM_strike-STRIKE_DIFF
+        
+        for CEPE in ['CE','PE']:
+            for STRIKE_TYPE in ['ATM']: #['ATM','ITM','OTM']
+                if CEPE == 'CE' and STRIKE_TYPE == 'ATM':
+                    STRIKE = CE_ATM
+                elif CEPE == 'CE' and STRIKE_TYPE == 'ITM':
+                    STRIKE = CE_ITM
+                elif CEPE == 'CE' and STRIKE_TYPE == 'OTM':
+                    STRIKE = CE_OTM
+                elif CEPE == 'PE' and STRIKE_TYPE == 'ATM':
+                    STRIKE = PE_ATM
+                elif CEPE == 'PE' and STRIKE_TYPE == 'ITM':
+                    STRIKE = PE_ITM
+                elif CEPE == 'PE' and STRIKE_TYPE == 'OTM':
+                    STRIKE = PE_OTM
+
+                #FILE_TO_LOAD = OPTIONS_DATA_LOCATION+EXPIRY_DATE_STRING+"\\"+UNDERLYING+"_"+CEPE+"_"+str(STRIKE)+".parquet"
+                FILE_TO_LOAD = os.path.join(OPTIONS_DATA_LOCATION, EXPIRY_DATE_STRING, f"{UNDERLYING}_{CEPE}_{str(STRIKE)}.parquet")
+
+                
+                # Load 1-minute data
+                data_1min = pd.read_parquet(FILE_TO_LOAD)
+                data_1min.drop_duplicates(inplace=True)
+                data_1min['datetime'] = pd.to_datetime(data_1min['datetime'])
+                data_1min.sort_values('datetime',inplace=True)
+                data_1min.set_index('datetime', inplace=True)
+
+                # Resample 1-minute data to Candle Timeframe
+                data_candle_TF = data_1min.resample(candle_timeframe).agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last'
+                }).dropna()
+
+                data_candle_TF['atr'] = data_candle_TF.ta.atr(length=atr_period)
+                #data_candle_TF['ma'] = data_candle_TF.ta.ema(length=maLength)
+                
+                
+                ## Now keep only the data for the day for which we want the graphs...
+                data_candle_TF = data_candle_TF[data_candle_TF.index.date == DATE]
+                data_1min = data_1min[data_1min.index.date == DATE]
+                
+
+                # Process trade signals with 15-minute and 1-minute data
+                trade_log = []
+                crossed_resistance_points = []  # Store the points where buy_above crossed, for plotting later.
+                trade_open = False
+                entry_price = None
+                target_price = None
+                stop_loss_price = None
+                recent_resistance_level = None
+                
+                entry_time = None  # Track entry time for trades
+
+                previous_4h_index = None
+                
+                
+                
+
+                indicator_levels = []
+                for idx_candle_TF, row_candle_TF in data_candle_TF.iterrows():
+                    log_and_display("idx_candle_TF : ",idx_candle_TF)
+                    
+                    
+                    
+                    # Collecting data for Plotting levels...
+                    open_price_candle_TF = row_candle_TF['open']
+                    atr_candle_TF = row_candle_TF['atr']
+                    
+                    ##################################################################################
+                    # Define the entry, SL and target rules of the Strategy here.
+                    ##################################################################################
+
+                    if STRATEGY_NUMBER == 1:
+                        
+                        ################################################################
+                        # Gann Levels based entry, and ATR(+ multiplier) based SL and Target.
+                        ################################################################
+                        
+                        signal_buy_above, signal_sell_below, signal_buy_target, signal_sell_target, signal_buy_sl, signal_sell_sl = Gann_get_buy_sell_entry_sl_target_levels(open_price_candle_TF, atr_candle_TF, multiplier)
+                        
+                        indicator_row = {
+                            'datetime': idx_candle_TF,
+                            'open': open_price_candle_TF,
+                            'recent_resistance_level': signal_buy_above,
+                            'entry_level': None,  # To be filled during trade
+                            'sl_level': None,     # To be filled during trade
+                            'target_level': None  # To be filled during trade
+                        }
+                    elif STRATEGY_NUMBER == 2:
+                        
+                        ################################################################
+                        # Wait and Trade 10% (Buy when the premium increases by 10%.)
+                        ################################################################
+                        
+                        signal_buy_above = open_price_candle_TF * 1.1
+                        signal_buy_target = signal_buy_above *1.2
+                        signal_buy_sl = signal_buy_above *0.9
+                        
+                        indicator_row = {
+                            'datetime': idx_candle_TF,
+                            'open': open_price_candle_TF,
+                            'recent_resistance_level': signal_buy_above,
+                            'entry_level': None,  # To be filled during trade
+                            'sl_level': None,     # To be filled during trade
+                            'target_level': None  # To be filled during trade
+                        }
+                    elif STRATEGY_NUMBER == 3:
+                        pass #write code here based on strategy...
+                    elif STRATEGY_NUMBER == 4:
+                        pass #write code here based on strategy...
+                        
+                        
+                    
+                    
+                    # Check if it's time to close any open trades at 3:00 PM
+                    if trade_open and idx_candle_TF.time() >= pd.Timestamp("15:00").time():
+                        exit_price = row_candle_TF['close']
+                        trade_log.append({
+                            'CEPE':CEPE,
+                            'STRIKE_TYPE':STRIKE_TYPE,
+                            'STRIKE':STRIKE,
+                            'Entry Time': entry_time,
+                            'Entry Price': entry_price,
+                            'Exit Time': idx_candle_TF,
+                            'Exit Price': exit_price,
+                            'PnL':  exit_price - entry_price
+                        })
+                        trade_open = False
+                        entry_price = None
+                        target_price = None
+                        stop_loss_price = None
+                        recent_resistance_level = None
+                        
+                        log_and_display(f"Closed trade at {exit_price} on {idx_candle_TF} due to 3:00 PM rule.")
+
+                    # Trading Hours
+                    if idx_candle_TF.time() < pd.Timestamp("09:15").time() or idx_candle_TF.time() >= pd.Timestamp("15:00").time():
+                        continue  # Skip this 5-minute period if outside trading hours
+
+                    # Get the recent_resistance_level
+                    if not trade_open:
+                        recent_resistance_level = signal_buy_above
+
+                    # Iterate over 1-minute data within the current higher TF candle.
+                    for idx_1min, row_1min in data_1min[(data_1min.index >= idx_candle_TF) & (data_1min.index < idx_candle_TF + pd.Timedelta(minutes=candle_timeframe_in_minutes))].iterrows():
+                        
+                        log_and_display("idx_1min : ",idx_1min)
+                        
+                        # Below code is written to mimic Broker Emulator concept of Trading view. Which is,
+                        # If the high price is closer to the ope of 
+ # Below code is written to mimic Broker Emulator concept of Trading view. Which is,
+                        # If the high price is closer to the opening price than the low price, it assumes that the price moved in this order on the bar: open → high → low → close.
+                        # If the low price is closer to the opening price than the high price, it assumes that the price moved in this order on the bar: open → low → high → close.
+                        if abs(row_1min['high'] - row_1min['open']) < abs(row_1min['low'] - row_1min['open']):
+                            sequence_to_follow = ['high','low']
+                        else:
+                            sequence_to_follow = ['low','high']
+                            
+                        for price_point_under_consideration in sequence_to_follow:
+                            
+                                if trade_open:
+                                    # Check for hitting stop loss
+                                    if price_point_under_consideration == 'low':
+                                        if row_1min['low'] <= stop_loss_price:
+                                            trade_log.append({
+                                                'CEPE':CEPE,
+                                                'STRIKE_TYPE':STRIKE_TYPE,
+                                                'STRIKE':STRIKE,
+                                                'Entry Time': entry_time,
+                                                'Entry Price': entry_price,
+                                                'Exit Time': idx_1min,
+                                                'Exit Price': stop_loss_price,
+                                                'PnL': stop_loss_price - entry_price
+                                            })
+                                            trade_open = False
+                                            entry_price = None
+                                            target_price = None
+                                            stop_loss_price = None
+                                            recent_resistance_level = None
+                                            
+                                            
+                                    # Check for hitting target
+                                    if price_point_under_consideration == 'high':
+                                        if row_1min['high'] > target_price:
+                                            trade_log.append({
+                                                'CEPE':CEPE,
+                                                'STRIKE_TYPE':STRIKE_TYPE,
+                                                'STRIKE':STRIKE,
+                                                'Entry Time': entry_time,
+                                                'Entry Price': entry_price,
+                                                'Exit Time': idx_1min,
+                                                'Exit Price': target_price,
+                                                'PnL': target_price - entry_price
+                                            })
+                                            trade_open = False
+                                            entry_price = None
+                                            target_price = None
+                                            stop_loss_price = None
+                                            recent_resistance_level = None
+                                            
+                                            
+                                else:
+                                    # Check for buy_above condition
+                                    if price_point_under_consideration == 'high':
+                                        if recent_resistance_level is not None and row_1min['high'] > recent_resistance_level:
+                                            #entry_price = row_1min['close']
+                                            entry_price = recent_resistance_level #plus slippage
+                                            target_price = signal_buy_target
+                                            stop_loss_price = signal_buy_sl
+                                            entry_time = idx_1min
+                                            trade_open = True
+                                            crossed_resistance_points.append((idx_candle_TF, recent_resistance_level))
+                                            log_and_display(f"Crossed resistance level {recent_resistance_level} at {idx_1min}.")
+                                            log_and_display(f"Entered trade at {entry_price} on {entry_time}")
+                        
+                        #log_and_display("Before : " , indicator_row)
+                        indicator_row['datetime'] = idx_1min
+                        indicator_row['entry_level'] = entry_price
+                        indicator_row['sl_level'] = stop_loss_price
+                        indicator_row['target_level'] = target_price
+                        #log_and_display("After  : " , indicator_row)
+                        log_and_display(indicator_row)
+                        indicator_levels.append(indicator_row.copy())
+
+                        
+                # Convert trade log to DataFrame
+                trade_log_df = pd.DataFrame(trade_log)
+                ALL_TRADES.extend(trade_log)
+
+                # Display trade log and total PnL
+                if trade_log_df.shape[0] >0:
+                    log_and_display(trade_log_df)
+                    total_pnl = trade_log_df['PnL'].sum()
+                    log_and_display(f"Total PnL: {total_pnl}")
+
+                indicator_levels_df = pandas.DataFrame(indicator_levels)
+                
+                # Plot OHLC candles in 1-minute timeframe
+                for day, daily_data in data_1min.groupby(data_1min.index.date):
+                    fig, ax = plt.subplots(figsize=(15, 7))
+                    
+                    # Plot 1-minute candlestick chart
+                    ax.plot(daily_data.index, daily_data['close'], color='black', lw=0.8, alpha=0.6, label='Close')
+                    ax.vlines(daily_data.index, daily_data['low'], daily_data['high'], color='black', lw=0.8, alpha=0.6)
+                    ax.vlines(daily_data.index, daily_data['open'], daily_data['close'], color='black', lw=0.8, alpha=0.6)
+                    
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+                    ax.set_title(f"OHLC Candles for {day}")
+                    ax.set_ylabel('Price')
+
+
+                    ##################################################################################
+                    # Plot calculated indicator levels for the respective strategy... As per need.
+                    ##################################################################################
+                    if indicator_levels_df.shape[0] > 0:
+                        if STRATEGY_NUMBER == 1:
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['open'], color='yellow', linestyle='--', lw=1, label='open')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['recent_resistance_level'], color='blue', linestyle='--', lw=1, label='Recent Resistance')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['entry_level'], color='purple', linestyle='--', lw=1, label='Entry Level')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['sl_level'], color='red', linestyle='--', lw=1, label='SL Level')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['target_level'], color='green', linestyle='--', lw=1, label='Target Level')
+                        elif STRATEGY_NUMBER == 2:
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['open'], color='yellow', linestyle='--', lw=1, label='open')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['recent_resistance_level'], color='blue', linestyle='--', lw=1, label='Recent Resistance')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['entry_level'], color='purple', linestyle='--', lw=1, label='Entry Level')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['sl_level'], color='red', linestyle='--', lw=1, label='SL Level')
+                            ax.plot(indicator_levels_df['datetime'], indicator_levels_df['target_level'], color='green', linestyle='--', lw=1, label='Target Level')
+                        elif STRATEGY_NUMBER == 3:
+                            pass #write code here based on strategy...
+                        elif STRATEGY_NUMBER == 4:
+                            pass #write code here based on strategy...
+
+                    # Plot trade entries and exits
+                    for _, trade in trade_log_df.iterrows():
+                        if trade['Entry Time'].date() == day:
+                            ax.annotate('Entry', xy=(trade['Entry Time'], trade['Entry Price']), xycoords='data',
+                                        xytext=(0, -10), textcoords='offset points',
+                                        arrowprops=dict(facecolor='green', shrink=0.05))
+                            ax.annotate('Exit', xy=(trade['Exit Time'], trade['Exit Price']), xycoords='data',
+                                        xytext=(0, 10), textcoords='offset points',
+                                        arrowprops=dict(facecolor='red', shrink=0.05))
+                    
+                    # Plot blue arrows for crossings
+                    for point in crossed_resistance_points:
+                        if point[0].date() == day:
+                            ax.annotate('', xy=(point[0], point[1]), xycoords='data', xytext=(-10, -20),
+                                        textcoords='offset points',
+                                        arrowprops=dict(facecolor='blue', shrink=0.05))
+
+                    # Adding a legend to make it clear what each line represents
+                    ax.legend()
+                    #plt.savefig(BT_LOCATION+"plots\\"+DATE_STRING+"_"+CEPE+"_"+str(STRIKE_TYPE)+"_"+str(STRIKE)+".png")
+                    plt.savefig(os.path.join(PLOTS_LOCATION, f"{DATE_STRING}_{CEPE}_{str(STRIKE_TYPE)}_{str(STRIKE)}.png"))
+
+                    #plt.show()
+                    plt.close(fig)
+    except Exception as e1:
+        log_and_display("Error : ",str(e1))
+        #raise(e1)
+
+
+########################################################################################################
+#      Step 3 : Save 
+#               - Trade log
+#               - PNL Curve 
+#               - Strategy performance stats
+########################################################################################################
+
+ALL_TRADES_DF = pd.DataFrame(ALL_TRADES)
+#ALL_TRADES_DF.to_parquet(BT_LOCATION+"ALL_TRADES.parquet")
+ALL_TRADES_DF.to_parquet(os.path.join(BT_LOCATION, "ALL_TRADES.parquet"))
+#ALL_TRADES_DF.to_csv(BT_LOCATION+"ALL_TRADES.csv")
+ALL_TRADES_DF.to_csv(os.path.join(BT_LOCATION, "ALL_TRADES.csv"))
+#ALL_TRADES_DF.to_excel(os.path.join(BT_LOCATION, "ALL_TRADES.xlsx"))
+
+# Plot pnl curve
+ALL_TRADES_DF.sort_values("Entry Time").set_index("Entry Time")["PnL"].cumsum().plot()
+#plt.savefig(BT_LOCATION+"pnl_curve.png")
+plt.savefig(os.path.join(BT_LOCATION, "pnl_curve.png"))
+#plt.show()
+plt.close(fig)
+
+#calculate_metrics
+#stats = calculate_metrics(ALL_TRADES_DF)
+stats = calculate_metrics(ALL_TRADES_DF, initial_balance=1000) #Calculating in points instead of amount for normalisation. Assuming ATM option is of price 1000 max and capital required to trade 1 quantity (LOT size = 1) is 1000 Rs.
+log_and_display(stats)
+#pandas.DataFrame([stats]).T.to_excel(BT_LOCATION+"stats.xlsx")
+pd.DataFrame([stats]).T.to_excel(os.path.join(BT_LOCATION, "stats.xlsx"))
+
+
+########################################################################################################
+#                                       Code Ends
+###################################################################################################
